@@ -62,7 +62,10 @@ function todayKey(date = new Date()): string {
 }
 
 function generateId(prefix = "adm"): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const suffix = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID().slice(0, 8)
+    : Math.random().toString(36).slice(2, 10);
+  return `${prefix}-${Date.now()}-${suffix}`;
 }
 
 function toStringValue(value: unknown, fallback = ""): string {
@@ -300,10 +303,43 @@ async function updateSyncState(ctx: PluginContext, updater: (current: SyncState)
   return next;
 }
 
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function recordGmailSyncError(ctx: PluginContext, config: AdminConfig, error: unknown): Promise<void> {
+  const message = toErrorMessage(error);
+  await updateSyncState(ctx, current => ({
+    ...current,
+    gmail: {
+      ...current.gmail,
+      enabled: config.gmailEnabled,
+      configured: Boolean(config.googleAuth),
+      lastError: message,
+    },
+  }));
+}
+
+async function recordCalendarSyncError(ctx: PluginContext, config: AdminConfig, error: unknown): Promise<void> {
+  const message = toErrorMessage(error);
+  await updateSyncState(ctx, current => ({
+    ...current,
+    calendar: {
+      ...current.calendar,
+      enabled: config.calendarEnabled,
+      configured: Boolean(config.googleAuth),
+      lastError: message,
+    },
+  }));
+}
+
 function parseEmailAddress(headerValue?: string): string | undefined {
-  if (!headerValue) return undefined;
-  const match = headerValue.match(/<([^>]+)>/);
-  return match?.[1] ?? headerValue;
+  const normalized = headerValue?.trim();
+  if (!normalized) return undefined;
+  const bracketMatch = normalized.match(/<([^>]+)>/);
+  const candidate = bracketMatch?.[1]?.trim() ?? normalized.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
+  if (!candidate) return undefined;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(candidate) ? candidate : undefined;
 }
 
 function getReplySubject(subject?: string): string {
@@ -499,7 +535,8 @@ async function getAdminConfig(ctx: PluginContext): Promise<AdminConfig> {
   const jobsEnabled = raw.jobsEnabled !== false;
   const rulesEnabled = raw.rulesEnabled !== false;
   const gmailUserId = toStringValue(raw.gmailUserId, "me");
-  const calendarIds = uniqueStrings(toArrayOfStrings(raw.calendarIds)).length > 0 ? uniqueStrings(toArrayOfStrings(raw.calendarIds)) : ["primary"];
+  const configuredCalendarIds = uniqueStrings(toArrayOfStrings(raw.calendarIds));
+  const calendarIds = configuredCalendarIds.length > 0 ? configuredCalendarIds : ["primary"];
   const clientId = toOptionalString(raw.googleClientId);
   const clientSecretRef = toOptionalString(raw.googleClientSecretRef);
   const refreshTokenRef = toOptionalString(raw.googleRefreshTokenRef);
@@ -517,7 +554,6 @@ async function getAdminConfig(ctx: PluginContext): Promise<AdminConfig> {
 
   if (gmailEnabled && !googleAuth) hints.push("Gmail sync is enabled but Google credentials are incomplete.");
   if (calendarEnabled && !googleAuth) hints.push("Calendar sync is enabled but Google credentials are incomplete.");
-  if (calendarEnabled && calendarIds.length === 0) hints.push("Add at least one calendar ID to enable calendar sync.");
   if (raw.gmailAutoReplyEnabled === true && raw.rulesEnabled !== true) hints.push("Auto-reply is enabled, but rules are disabled so it will never run.");
 
   return {
@@ -537,6 +573,38 @@ async function getAdminConfig(ctx: PluginContext): Promise<AdminConfig> {
     googleAuth,
     configHints: hints,
   };
+}
+
+function validateAdminConfigInput(config: Record<string, unknown>): { warnings: string[]; errors: string[] } {
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  const gmailEnabled = config.gmailEnabled !== false;
+  const calendarEnabled = config.calendarEnabled !== false;
+  const rulesEnabled = config.rulesEnabled !== false;
+  const jobsEnabled = config.jobsEnabled !== false;
+  const gmailAutoReplyEnabled = config.gmailAutoReplyEnabled === true;
+  const hasGoogleClientId = Boolean(toOptionalString(config.googleClientId));
+  const hasGoogleClientSecretRef = Boolean(toOptionalString(config.googleClientSecretRef));
+  const hasGoogleRefreshTokenRef = Boolean(toOptionalString(config.googleRefreshTokenRef));
+  const calendarIds = uniqueStrings(toArrayOfStrings(config.calendarIds));
+
+  if ((gmailEnabled || calendarEnabled) && !(hasGoogleClientId && hasGoogleClientSecretRef && hasGoogleRefreshTokenRef)) {
+    errors.push("Google sync is enabled but Google OAuth client ID, client secret ref, and refresh token ref are not all configured.");
+  }
+  if (calendarEnabled && calendarIds.length === 0) {
+    errors.push("Calendar sync is enabled but no calendar IDs are configured.");
+  }
+  if (gmailAutoReplyEnabled && !gmailEnabled) {
+    warnings.push("Auto-reply is enabled while Gmail sync is disabled.");
+  }
+  if (gmailAutoReplyEnabled && !rulesEnabled) {
+    warnings.push("Auto-reply is enabled but inbox rules are disabled, so no automatic replies will run.");
+  }
+  if (jobsEnabled && !gmailEnabled && !calendarEnabled) {
+    warnings.push("Scheduled jobs are enabled but both Gmail and Calendar sync are disabled.");
+  }
+
+  return { warnings, errors };
 }
 
 function ensureGoogleConfig(config: AdminConfig): asserts config is AdminConfig & { googleAuth: NonNullable<AdminConfig["googleAuth"]> } {
@@ -632,53 +700,58 @@ async function runGmailFullSync(
 ): Promise<Record<string, unknown>> {
   const config = await getAdminConfig(ctx);
   if (!config.gmailEnabled) return { success: false, reason: "gmail_disabled" };
-  const accessToken = await getGoogleAccessToken(ctx, config);
-  const query = toOptionalString(params.query) ?? buildGmailQuery(config);
-  const maxResults = clampMin(toNumber(params.maxResults, config.gmailMaxResults), 1);
+  try {
+    const accessToken = await getGoogleAccessToken(ctx, config);
+    const query = toOptionalString(params.query) ?? buildGmailQuery(config);
+    const maxResults = clampMin(toNumber(params.maxResults, config.gmailMaxResults), 1);
 
-  const ids: string[] = [];
-  let pageToken: string | undefined;
-  do {
-    const page = await gmailListMessagesPage(ctx, accessToken, config.gmailUserId, { q: query, maxResults: Math.min(maxResults, 100), pageToken });
-    ids.push(...(page.messages ?? []).map(message => message.id));
-    pageToken = ids.length >= maxResults ? undefined : page.nextPageToken;
-  } while (pageToken);
+    const ids: string[] = [];
+    let pageToken: string | undefined;
+    do {
+      const page = await gmailListMessagesPage(ctx, accessToken, config.gmailUserId, { q: query, maxResults: Math.min(maxResults, 100), pageToken });
+      ids.push(...(page.messages ?? []).map(message => message.id));
+      pageToken = ids.length >= maxResults ? undefined : page.nextPageToken;
+    } while (pageToken);
 
-  const uniqueIds = uniqueStrings(ids).slice(0, maxResults);
-  const messages = uniqueIds.length ? await fetchMessagesById(ctx, accessToken, config.gmailUserId, uniqueIds) : [];
-  const existing = await getCollection<InboxItem>(ctx, DATA_KEYS.INBOX_ITEMS);
-  const existingByExternalId = new Map(existing.filter(item => item.source === "gmail" && item.externalId).map(item => [item.externalId as string, item]));
-  const syncedGmailItems = messages.map(message => inboxItemFromGmailMessage(message, existingByExternalId.get(message.id)));
-  const manualItems = existing.filter(item => item.source !== "gmail");
-  const combined = sortInboxItems([...manualItems, ...syncedGmailItems]);
-  await setCollection(ctx, DATA_KEYS.INBOX_ITEMS, combined);
+    const uniqueIds = uniqueStrings(ids).slice(0, maxResults);
+    const messages = uniqueIds.length ? await fetchMessagesById(ctx, accessToken, config.gmailUserId, uniqueIds) : [];
+    const existing = await getCollection<InboxItem>(ctx, DATA_KEYS.INBOX_ITEMS);
+    const existingByExternalId = new Map(existing.filter(item => item.source === "gmail" && item.externalId).map(item => [item.externalId as string, item]));
+    const syncedGmailItems = messages.map(message => inboxItemFromGmailMessage(message, existingByExternalId.get(message.id)));
+    const manualItems = existing.filter(item => item.source !== "gmail");
+    const combined = sortInboxItems([...manualItems, ...syncedGmailItems]);
+    await setCollection(ctx, DATA_KEYS.INBOX_ITEMS, combined);
 
-  const syncState = await updateSyncState(ctx, current => ({
-    ...current,
-    gmail: {
-      ...current.gmail,
-      enabled: true,
-      configured: Boolean(config.googleAuth),
-      lastFullSyncAt: nowIso(),
-      lastError: undefined,
-      historyId: getLatestHistoryId(messages) ?? current.gmail.historyId,
-      inboxCount: syncedGmailItems.length,
-    },
-  }));
+    const syncState = await updateSyncState(ctx, current => ({
+      ...current,
+      gmail: {
+        ...current.gmail,
+        enabled: true,
+        configured: Boolean(config.googleAuth),
+        lastFullSyncAt: nowIso(),
+        lastError: undefined,
+        historyId: getLatestHistoryId(messages) ?? current.gmail.historyId,
+        inboxCount: syncedGmailItems.length,
+      },
+    }));
 
-  await emitAdminUpdate(ctx, { type: "gmail-full-sync", syncedCount: syncedGmailItems.length, query });
-  await logActivity(ctx, options.companyId, `Gmail full sync imported ${syncedGmailItems.length} messages`, { reason: options.reason ?? "action", query });
+    await emitAdminUpdate(ctx, { type: "gmail-full-sync", syncedCount: syncedGmailItems.length, query });
+    await logActivity(ctx, options.companyId, `Gmail full sync imported ${syncedGmailItems.length} messages`, { reason: options.reason ?? "action", query });
 
-  if (config.rulesEnabled && params.applyRules !== false) {
-    await runRulesEngine(ctx, { ids: syncedGmailItems.map(item => item.id), applyRemote: true }, { companyId: options.companyId, reason: "gmail-full-sync" });
+    if (config.rulesEnabled && params.applyRules !== false) {
+      await runRulesEngine(ctx, { ids: syncedGmailItems.map(item => item.id), applyRemote: true }, { companyId: options.companyId, reason: "gmail-full-sync" });
+    }
+
+    return {
+      success: true,
+      syncedCount: syncedGmailItems.length,
+      historyId: syncState.gmail.historyId,
+      query,
+    };
+  } catch (error) {
+    await recordGmailSyncError(ctx, config, error);
+    throw error;
   }
-
-  return {
-    success: true,
-    syncedCount: syncedGmailItems.length,
-    historyId: syncState.gmail.historyId,
-    query,
-  };
 }
 
 async function runGmailIncrementalSync(
@@ -688,80 +761,85 @@ async function runGmailIncrementalSync(
 ): Promise<Record<string, unknown>> {
   const config = await getAdminConfig(ctx);
   if (!config.gmailEnabled) return { success: false, reason: "gmail_disabled" };
-  const state = await getSyncState(ctx);
-  if (!state.gmail.historyId) {
-    return runGmailFullSync(ctx, params, { ...options, reason: options.reason ?? "fallback-full-sync" });
-  }
-
-  const accessToken = await getGoogleAccessToken(ctx, config);
-  const changedIds = new Set<string>();
-  const deletedIds = new Set<string>();
-  let nextPageToken: string | undefined;
-  let latestHistoryId = state.gmail.historyId;
-
   try {
-    do {
-      const page = await gmailListHistoryPage(ctx, accessToken, config.gmailUserId, state.gmail.historyId, nextPageToken);
-      latestHistoryId = page.historyId ?? latestHistoryId;
-      for (const entry of page.history ?? []) {
-        latestHistoryId = entry.id ?? latestHistoryId;
-        for (const message of entry.messages ?? []) if (message.id) changedIds.add(message.id);
-        for (const message of entry.messagesAdded ?? []) if (message.message?.id) changedIds.add(message.message.id);
-        for (const message of entry.labelsAdded ?? []) if (message.message?.id) changedIds.add(message.message.id);
-        for (const message of entry.labelsRemoved ?? []) if (message.message?.id) changedIds.add(message.message.id);
-        for (const message of entry.messagesDeleted ?? []) if (message.message?.id) deletedIds.add(message.message.id);
-      }
-      nextPageToken = page.nextPageToken;
-    } while (nextPageToken);
-  } catch (error) {
-    if (error instanceof GoogleApiError && (error.status === 404 || error.status === 400)) {
-      return runGmailFullSync(ctx, params, { ...options, reason: "invalid-history-fallback" });
+    const state = await getSyncState(ctx);
+    if (!state.gmail.historyId) {
+      return runGmailFullSync(ctx, params, { ...options, reason: options.reason ?? "fallback-full-sync" });
     }
+
+    const accessToken = await getGoogleAccessToken(ctx, config);
+    const changedIds = new Set<string>();
+    const deletedIds = new Set<string>();
+    let nextPageToken: string | undefined;
+    let latestHistoryId = state.gmail.historyId;
+
+    try {
+      do {
+        const page = await gmailListHistoryPage(ctx, accessToken, config.gmailUserId, state.gmail.historyId, nextPageToken);
+        latestHistoryId = page.historyId ?? latestHistoryId;
+        for (const entry of page.history ?? []) {
+          latestHistoryId = entry.id ?? latestHistoryId;
+          for (const message of entry.messages ?? []) if (message.id) changedIds.add(message.id);
+          for (const message of entry.messagesAdded ?? []) if (message.message?.id) changedIds.add(message.message.id);
+          for (const message of entry.labelsAdded ?? []) if (message.message?.id) changedIds.add(message.message.id);
+          for (const message of entry.labelsRemoved ?? []) if (message.message?.id) changedIds.add(message.message.id);
+          for (const message of entry.messagesDeleted ?? []) if (message.message?.id) deletedIds.add(message.message.id);
+        }
+        nextPageToken = page.nextPageToken;
+      } while (nextPageToken);
+    } catch (error) {
+      if (error instanceof GoogleApiError && (error.status === 404 || error.status === 400)) {
+        return runGmailFullSync(ctx, params, { ...options, reason: "invalid-history-fallback" });
+      }
+      throw error;
+    }
+
+    const idsToFetch = [...changedIds].filter(id => !deletedIds.has(id));
+    const messages = idsToFetch.length ? await fetchMessagesById(ctx, accessToken, config.gmailUserId, idsToFetch) : [];
+    const existing = await getCollection<InboxItem>(ctx, DATA_KEYS.INBOX_ITEMS);
+    const existingGmail = existing.filter(item => item.source === "gmail");
+    const manualItems = existing.filter(item => item.source !== "gmail");
+    const updatedByExternalId = new Map(existingGmail.map(item => [item.externalId as string, item]));
+    const changedItems = messages.map(message => inboxItemFromGmailMessage(message, updatedByExternalId.get(message.id)));
+    const changedExternalIds = new Set(changedItems.map(item => item.externalId));
+    const retained = existingGmail.filter(item => item.externalId && !deletedIds.has(item.externalId) && !changedExternalIds.has(item.externalId));
+    const combined = sortInboxItems([...manualItems, ...retained, ...changedItems]);
+    await setCollection(ctx, DATA_KEYS.INBOX_ITEMS, combined);
+
+    await updateSyncState(ctx, current => ({
+      ...current,
+      gmail: {
+        ...current.gmail,
+        enabled: true,
+        configured: Boolean(config.googleAuth),
+        historyId: latestHistoryId,
+        inboxCount: combined.filter(item => item.source === "gmail").length,
+        lastIncrementalSyncAt: nowIso(),
+        lastError: undefined,
+      },
+    }));
+
+    await emitAdminUpdate(ctx, { type: "gmail-incremental-sync", changedCount: changedItems.length, deletedCount: deletedIds.size });
+    await logActivity(ctx, options.companyId, `Gmail incremental sync refreshed ${changedItems.length} messages`, {
+      reason: options.reason ?? "action",
+      changedCount: changedItems.length,
+      deletedCount: deletedIds.size,
+    });
+
+    if (config.rulesEnabled && params.applyRules !== false && changedItems.length > 0) {
+      await runRulesEngine(ctx, { ids: changedItems.map(item => item.id), applyRemote: true }, { companyId: options.companyId, reason: "gmail-incremental-sync" });
+    }
+
+    return {
+      success: true,
+      changedCount: changedItems.length,
+      deletedCount: deletedIds.size,
+      historyId: latestHistoryId,
+    };
+  } catch (error) {
+    await recordGmailSyncError(ctx, config, error);
     throw error;
   }
-
-  const idsToFetch = [...changedIds].filter(id => !deletedIds.has(id));
-  const messages = idsToFetch.length ? await fetchMessagesById(ctx, accessToken, config.gmailUserId, idsToFetch) : [];
-  const existing = await getCollection<InboxItem>(ctx, DATA_KEYS.INBOX_ITEMS);
-  const existingGmail = existing.filter(item => item.source === "gmail");
-  const manualItems = existing.filter(item => item.source !== "gmail");
-  const updatedByExternalId = new Map(existingGmail.map(item => [item.externalId as string, item]));
-  const changedItems = messages.map(message => inboxItemFromGmailMessage(message, updatedByExternalId.get(message.id)));
-  const changedExternalIds = new Set(changedItems.map(item => item.externalId));
-  const retained = existingGmail.filter(item => item.externalId && !deletedIds.has(item.externalId) && !changedExternalIds.has(item.externalId));
-  const combined = sortInboxItems([...manualItems, ...retained, ...changedItems]);
-  await setCollection(ctx, DATA_KEYS.INBOX_ITEMS, combined);
-
-  await updateSyncState(ctx, current => ({
-    ...current,
-    gmail: {
-      ...current.gmail,
-      enabled: true,
-      configured: Boolean(config.googleAuth),
-      historyId: latestHistoryId,
-      inboxCount: combined.filter(item => item.source === "gmail").length,
-      lastIncrementalSyncAt: nowIso(),
-      lastError: undefined,
-    },
-  }));
-
-  await emitAdminUpdate(ctx, { type: "gmail-incremental-sync", changedCount: changedItems.length, deletedCount: deletedIds.size });
-  await logActivity(ctx, options.companyId, `Gmail incremental sync refreshed ${changedItems.length} messages`, {
-    reason: options.reason ?? "action",
-    changedCount: changedItems.length,
-    deletedCount: deletedIds.size,
-  });
-
-  if (config.rulesEnabled && params.applyRules !== false && changedItems.length > 0) {
-    await runRulesEngine(ctx, { ids: changedItems.map(item => item.id), applyRemote: true }, { companyId: options.companyId, reason: "gmail-incremental-sync" });
-  }
-
-  return {
-    success: true,
-    changedCount: changedItems.length,
-    deletedCount: deletedIds.size,
-    historyId: latestHistoryId,
-  };
 }
 
 function normalizeCalendarEvent(apiEvent: GoogleCalendarEvent, calendarId: string, existing?: CalendarEvent): CalendarEvent | null {
@@ -864,57 +942,62 @@ async function runCalendarFullSync(
 ): Promise<Record<string, unknown>> {
   const config = await getAdminConfig(ctx);
   if (!config.calendarEnabled) return { success: false, reason: "calendar_disabled" };
-  const accessToken = await getGoogleAccessToken(ctx, config);
-  const existing = await getCollection<CalendarEvent>(ctx, DATA_KEYS.CALENDAR_EVENTS);
-  const existingByExternal = new Map(existing.map(event => [`${event.calendarId}:${event.externalId}`, event]));
-  const timeMin = new Date(parseDate(todayKey()).getTime() - config.calendarLookbackDays * 86400000).toISOString();
-  const timeMax = new Date(parseDate(todayKey()).getTime() + config.calendarLookaheadDays * 86400000).toISOString();
-  const nextEvents: CalendarEvent[] = [];
-  const calendarStatus: SyncState["calendar"]["calendars"] = {};
+  try {
+    const accessToken = await getGoogleAccessToken(ctx, config);
+    const existing = await getCollection<CalendarEvent>(ctx, DATA_KEYS.CALENDAR_EVENTS);
+    const existingByExternal = new Map(existing.map(event => [`${event.calendarId}:${event.externalId}`, event]));
+    const timeMin = new Date(parseDate(todayKey()).getTime() - config.calendarLookbackDays * 86400000).toISOString();
+    const timeMax = new Date(parseDate(todayKey()).getTime() + config.calendarLookaheadDays * 86400000).toISOString();
+    const nextEvents: CalendarEvent[] = [];
+    const calendarStatus: SyncState["calendar"]["calendars"] = {};
 
-  for (const calendarId of config.calendarIds) {
-    let pageToken: string | undefined;
-    let nextSyncToken: string | undefined;
-    do {
-      const page = await calendarListEvents(ctx, accessToken, calendarId, {
-        pageToken,
-        timeMin,
-        timeMax,
-        maxResults: 250,
-      });
-      for (const apiEvent of page.items ?? []) {
-        const normalized = normalizeCalendarEvent(apiEvent, calendarId, existingByExternal.get(`${calendarId}:${apiEvent.id}`));
-        if (normalized) nextEvents.push(normalized);
-      }
-      nextSyncToken = page.nextSyncToken ?? nextSyncToken;
-      pageToken = page.nextPageToken;
-    } while (pageToken);
-    calendarStatus[calendarId] = {
-      calendarId,
-      syncToken: nextSyncToken,
-      lastSyncAt: nowIso(),
-      eventCount: nextEvents.filter(event => event.calendarId === calendarId).length,
-    };
+    for (const calendarId of config.calendarIds) {
+      let pageToken: string | undefined;
+      let nextSyncToken: string | undefined;
+      do {
+        const page = await calendarListEvents(ctx, accessToken, calendarId, {
+          pageToken,
+          timeMin,
+          timeMax,
+          maxResults: 250,
+        });
+        for (const apiEvent of page.items ?? []) {
+          const normalized = normalizeCalendarEvent(apiEvent, calendarId, existingByExternal.get(`${calendarId}:${apiEvent.id}`));
+          if (normalized) nextEvents.push(normalized);
+        }
+        nextSyncToken = page.nextSyncToken ?? nextSyncToken;
+        pageToken = page.nextPageToken;
+      } while (pageToken);
+      calendarStatus[calendarId] = {
+        calendarId,
+        syncToken: nextSyncToken,
+        lastSyncAt: nowIso(),
+        eventCount: nextEvents.filter(event => event.calendarId === calendarId).length,
+      };
+    }
+
+    await setCollection(ctx, DATA_KEYS.CALENDAR_EVENTS, sortCalendarEvents(nextEvents));
+    await rebuildMeetingsAndPrep(ctx, nextEvents, config.calendarPrepLeadDays);
+    await updateSyncState(ctx, current => ({
+      ...current,
+      calendar: {
+        ...current.calendar,
+        enabled: true,
+        configured: Boolean(config.googleAuth),
+        lastFullSyncAt: nowIso(),
+        lastError: undefined,
+        calendars: calendarStatus,
+        eventCount: nextEvents.length,
+      },
+    }));
+
+    await emitAdminUpdate(ctx, { type: "calendar-full-sync", syncedCount: nextEvents.length });
+    await logActivity(ctx, options.companyId, `Calendar full sync imported ${nextEvents.length} events`, { reason: options.reason ?? "action" });
+    return { success: true, syncedCount: nextEvents.length };
+  } catch (error) {
+    await recordCalendarSyncError(ctx, config, error);
+    throw error;
   }
-
-  await setCollection(ctx, DATA_KEYS.CALENDAR_EVENTS, sortCalendarEvents(nextEvents));
-  await rebuildMeetingsAndPrep(ctx, nextEvents, config.calendarPrepLeadDays);
-  await updateSyncState(ctx, current => ({
-    ...current,
-    calendar: {
-      ...current.calendar,
-      enabled: true,
-      configured: Boolean(config.googleAuth),
-      lastFullSyncAt: nowIso(),
-      lastError: undefined,
-      calendars: calendarStatus,
-      eventCount: nextEvents.length,
-    },
-  }));
-
-  await emitAdminUpdate(ctx, { type: "calendar-full-sync", syncedCount: nextEvents.length });
-  await logActivity(ctx, options.companyId, `Calendar full sync imported ${nextEvents.length} events`, { reason: options.reason ?? "action" });
-  return { success: true, syncedCount: nextEvents.length };
 }
 
 async function runCalendarIncrementalSync(
@@ -924,74 +1007,79 @@ async function runCalendarIncrementalSync(
 ): Promise<Record<string, unknown>> {
   const config = await getAdminConfig(ctx);
   if (!config.calendarEnabled) return { success: false, reason: "calendar_disabled" };
-  const state = await getSyncState(ctx);
-  const allTokensPresent = config.calendarIds.every(calendarId => state.calendar.calendars[calendarId]?.syncToken);
-  if (!allTokensPresent) {
-    return runCalendarFullSync(ctx, params, { ...options, reason: options.reason ?? "fallback-full-sync" });
-  }
-
-  const accessToken = await getGoogleAccessToken(ctx, config);
-  const existing = await getCollection<CalendarEvent>(ctx, DATA_KEYS.CALENDAR_EVENTS);
-  const existingMap = new Map(existing.map(event => [`${event.calendarId}:${event.externalId}`, event]));
-  const deletedKeys = new Set<string>();
-  const calendarStatus = { ...state.calendar.calendars };
-
   try {
-    for (const calendarId of config.calendarIds) {
-      let pageToken: string | undefined;
-      let nextSyncToken = state.calendar.calendars[calendarId]?.syncToken;
-      do {
-        const page = await calendarListEvents(ctx, accessToken, calendarId, {
-          pageToken,
-          syncToken: state.calendar.calendars[calendarId]?.syncToken,
-          showDeleted: true,
-        });
-        for (const apiEvent of page.items ?? []) {
-          const key = `${calendarId}:${apiEvent.id}`;
-          if (apiEvent.status === "cancelled") {
-            deletedKeys.add(key);
-            existingMap.delete(key);
-            continue;
+    const state = await getSyncState(ctx);
+    const allTokensPresent = config.calendarIds.every(calendarId => state.calendar.calendars[calendarId]?.syncToken);
+    if (!allTokensPresent) {
+      return runCalendarFullSync(ctx, params, { ...options, reason: options.reason ?? "fallback-full-sync" });
+    }
+
+    const accessToken = await getGoogleAccessToken(ctx, config);
+    const existing = await getCollection<CalendarEvent>(ctx, DATA_KEYS.CALENDAR_EVENTS);
+    const existingMap = new Map(existing.map(event => [`${event.calendarId}:${event.externalId}`, event]));
+    const deletedKeys = new Set<string>();
+    const calendarStatus = { ...state.calendar.calendars };
+
+    try {
+      for (const calendarId of config.calendarIds) {
+        let pageToken: string | undefined;
+        let nextSyncToken = state.calendar.calendars[calendarId]?.syncToken;
+        do {
+          const page = await calendarListEvents(ctx, accessToken, calendarId, {
+            pageToken,
+            syncToken: state.calendar.calendars[calendarId]?.syncToken,
+            showDeleted: true,
+          });
+          for (const apiEvent of page.items ?? []) {
+            const key = `${calendarId}:${apiEvent.id}`;
+            if (apiEvent.status === "cancelled") {
+              deletedKeys.add(key);
+              existingMap.delete(key);
+              continue;
+            }
+            const normalized = normalizeCalendarEvent(apiEvent, calendarId, existingMap.get(key));
+            if (normalized) existingMap.set(key, normalized);
           }
-          const normalized = normalizeCalendarEvent(apiEvent, calendarId, existingMap.get(key));
-          if (normalized) existingMap.set(key, normalized);
-        }
-        nextSyncToken = page.nextSyncToken ?? nextSyncToken;
-        pageToken = page.nextPageToken;
-      } while (pageToken);
-      calendarStatus[calendarId] = {
-        calendarId,
-        syncToken: nextSyncToken,
-        lastSyncAt: nowIso(),
-        eventCount: [...existingMap.values()].filter(event => event.calendarId === calendarId).length,
-      };
+          nextSyncToken = page.nextSyncToken ?? nextSyncToken;
+          pageToken = page.nextPageToken;
+        } while (pageToken);
+        calendarStatus[calendarId] = {
+          calendarId,
+          syncToken: nextSyncToken,
+          lastSyncAt: nowIso(),
+          eventCount: [...existingMap.values()].filter(event => event.calendarId === calendarId).length,
+        };
+      }
+    } catch (error) {
+      if (error instanceof GoogleApiError && (error.status === 410 || error.status === 400)) {
+        return runCalendarFullSync(ctx, params, { ...options, reason: "invalid-sync-token-fallback" });
+      }
+      throw error;
     }
+
+    const combined = sortCalendarEvents([...existingMap.values()]);
+    await setCollection(ctx, DATA_KEYS.CALENDAR_EVENTS, combined);
+    await rebuildMeetingsAndPrep(ctx, combined, config.calendarPrepLeadDays);
+    await updateSyncState(ctx, current => ({
+      ...current,
+      calendar: {
+        ...current.calendar,
+        enabled: true,
+        configured: Boolean(config.googleAuth),
+        lastIncrementalSyncAt: nowIso(),
+        lastError: undefined,
+        calendars: calendarStatus,
+        eventCount: combined.length,
+      },
+    }));
+
+    await emitAdminUpdate(ctx, { type: "calendar-incremental-sync", syncedCount: combined.length, removedCount: deletedKeys.size });
+    await logActivity(ctx, options.companyId, `Calendar incremental sync refreshed ${combined.length} events`, { reason: options.reason ?? "action", removedCount: deletedKeys.size });
+    return { success: true, syncedCount: combined.length, removedCount: deletedKeys.size };
   } catch (error) {
-    if (error instanceof GoogleApiError && (error.status === 410 || error.status === 400)) {
-      return runCalendarFullSync(ctx, params, { ...options, reason: "invalid-sync-token-fallback" });
-    }
+    await recordCalendarSyncError(ctx, config, error);
     throw error;
   }
-
-  const combined = sortCalendarEvents([...existingMap.values()]);
-  await setCollection(ctx, DATA_KEYS.CALENDAR_EVENTS, combined);
-  await rebuildMeetingsAndPrep(ctx, combined, config.calendarPrepLeadDays);
-  await updateSyncState(ctx, current => ({
-    ...current,
-    calendar: {
-      ...current.calendar,
-      enabled: true,
-      configured: Boolean(config.googleAuth),
-      lastIncrementalSyncAt: nowIso(),
-      lastError: undefined,
-      calendars: calendarStatus,
-      eventCount: combined.length,
-    },
-  }));
-
-  await emitAdminUpdate(ctx, { type: "calendar-incremental-sync", syncedCount: combined.length, removedCount: deletedKeys.size });
-  await logActivity(ctx, options.companyId, `Calendar incremental sync refreshed ${combined.length} events`, { reason: options.reason ?? "action", removedCount: deletedKeys.size });
-  return { success: true, syncedCount: combined.length, removedCount: deletedKeys.size };
 }
 
 async function runGmailReply(
@@ -1236,10 +1324,11 @@ async function buildDashboardData(ctx: PluginContext): Promise<AdminDashboardDat
     getCollection<DailyBriefing>(ctx, DATA_KEYS.DAILY_BRIEFINGS),
   ]);
 
+  const dashboardNow = nowIso();
   const latestBriefing = [...briefings].sort((left, right) => right.date.localeCompare(left.date))[0];
   const recentInbox = sortInboxItems(inbox).slice(0, 8);
-  const upcomingMeetings = sortMeetings(meetings).filter(meeting => meeting.scheduledAt >= nowIso()).slice(0, 6);
-  const upcomingEvents = sortCalendarEvents(calendarEvents).filter(event => event.startAt >= nowIso()).slice(0, 6);
+  const upcomingMeetings = sortMeetings(meetings).filter(meeting => meeting.scheduledAt >= dashboardNow).slice(0, 6);
+  const upcomingEvents = sortCalendarEvents(calendarEvents).filter(event => event.startAt >= dashboardNow).slice(0, 6);
 
   return {
     sync,
@@ -1279,6 +1368,24 @@ async function runSyncAll(ctx: PluginContext, params: ActionParams = {}, options
     briefing: briefing.summary,
     errors: failures.map(result => result.error ?? result.reason).filter(Boolean),
   };
+}
+
+function toolFailureReason(result: Record<string, unknown>): string | undefined {
+  const directError = toOptionalString(result.error);
+  if (directError) return directError;
+  const reason = toOptionalString(result.reason);
+  if (reason) return reason;
+  if (Array.isArray(result.errors)) {
+    return result.errors.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).join("\n") || undefined;
+  }
+  return undefined;
+}
+
+function toToolResponse(successMessage: string, result: Record<string, unknown>): { content?: string; error?: string; data: Record<string, unknown> } {
+  if (result.success === false) {
+    return { error: toolFailureReason(result) ?? "tool_failed", data: result };
+  }
+  return { content: successMessage, data: result };
 }
 
 const toolSchemas = {
@@ -1895,11 +2002,7 @@ const plugin = definePlugin({
       try {
         await runGmailIncrementalSync(ctx, { applyRules: true }, { reason: JOB_KEYS.GMAIL_INCREMENTAL_SYNC });
       } catch (error) {
-        await updateSyncState(ctx, current => ({
-          ...current,
-          gmail: { ...current.gmail, lastError: error instanceof Error ? error.message : String(error) },
-        }));
-        ctx.logger.error("Gmail incremental sync job failed", { error: error instanceof Error ? error.message : String(error) });
+        ctx.logger.error("Gmail incremental sync job failed", { error: toErrorMessage(error) });
       }
     });
 
@@ -1909,18 +2012,17 @@ const plugin = definePlugin({
       try {
         await runCalendarIncrementalSync(ctx, {}, { reason: JOB_KEYS.CALENDAR_INCREMENTAL_SYNC });
       } catch (error) {
-        await updateSyncState(ctx, current => ({
-          ...current,
-          calendar: { ...current.calendar, lastError: error instanceof Error ? error.message : String(error) },
-        }));
-        ctx.logger.error("Calendar incremental sync job failed", { error: error instanceof Error ? error.message : String(error) });
+        ctx.logger.error("Calendar incremental sync job failed", { error: toErrorMessage(error) });
       }
     });
 
     ctx.jobs.register(JOB_KEYS.DAILY_ADMIN_REFRESH, async () => {
       const config = await getAdminConfig(ctx);
       if (!config.jobsEnabled) return;
-      await runSyncAll(ctx, { mode: "full", applyRules: true }, { reason: JOB_KEYS.DAILY_ADMIN_REFRESH });
+      const result = await runSyncAll(ctx, { mode: "full", applyRules: true }, { reason: JOB_KEYS.DAILY_ADMIN_REFRESH });
+      if (result.success === false) {
+        ctx.logger.warn("Daily admin refresh completed with sync errors", { errors: result.errors });
+      }
     });
 
     ctx.events.on("agent.run.finished", async event => {
@@ -1935,17 +2037,17 @@ const plugin = definePlugin({
     ctx.tools.register(TOOL_KEYS.SYNC_GMAIL, toolSchemas[TOOL_KEYS.SYNC_GMAIL], async params => {
       const input = isObject(params) ? params : {};
       const result = input.mode === "full" ? await runGmailFullSync(ctx, {}, { reason: "tool" }) : await runGmailIncrementalSync(ctx, {}, { reason: "tool" });
-      return { content: `Gmail sync complete`, data: result };
+      return toToolResponse("Gmail sync complete", result);
     });
     ctx.tools.register(TOOL_KEYS.SYNC_CALENDAR, toolSchemas[TOOL_KEYS.SYNC_CALENDAR], async params => {
       const input = isObject(params) ? params : {};
       const result = input.mode === "full" ? await runCalendarFullSync(ctx, {}, { reason: "tool" }) : await runCalendarIncrementalSync(ctx, {}, { reason: "tool" });
-      return { content: `Calendar sync complete`, data: result };
+      return toToolResponse("Calendar sync complete", result);
     });
     ctx.tools.register(TOOL_KEYS.RUN_RULES, toolSchemas[TOOL_KEYS.RUN_RULES], async params => {
       const input = isObject(params) ? params : {};
       const result = await runRulesEngine(ctx, { applyRemote: input.applyRemote !== false }, { reason: "tool" });
-      return { content: `Rules processed ${result.matchedCount ?? 0} matches`, data: result };
+      return result.success === false ? toToolResponse("Rules run complete", result) : { content: `Rules processed ${result.matchedCount ?? 0} matches`, data: result };
     });
     ctx.tools.register(TOOL_KEYS.GENERATE_BRIEFING, toolSchemas[TOOL_KEYS.GENERATE_BRIEFING], async params => {
       const input = isObject(params) ? params : {};
@@ -1960,6 +2062,15 @@ const plugin = definePlugin({
     });
 
     ctx.logger.info("Personal Admin plugin initialized", { pluginId: PLUGIN_ID, featureSet: "integrated-admin-console" });
+  },
+
+  async onValidateConfig(config) {
+    const result = validateAdminConfigInput(config);
+    return {
+      ok: result.errors.length === 0,
+      warnings: result.warnings.length > 0 ? result.warnings : undefined,
+      errors: result.errors.length > 0 ? result.errors : undefined,
+    };
   },
 
   async onHealth() {

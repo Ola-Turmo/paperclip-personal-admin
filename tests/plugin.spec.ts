@@ -352,4 +352,75 @@ describe("Personal Admin integrated plugin", () => {
     expect(result.success).toBe(false);
     expect(result.errors).toEqual(expect.arrayContaining([expect.stringContaining("Google API request failed with 500")]));
   });
+
+  it("persists sync errors for failed Gmail actions and surfaces disabled tool failures honestly", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const parsed = new URL(url);
+
+      if (parsed.hostname === "oauth2.googleapis.com") {
+        return jsonResponse({ access_token: "access-token" });
+      }
+
+      if (parsed.pathname.endsWith("/messages")) {
+        return jsonResponse({ error: { message: "boom" } }, 500);
+      }
+
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const harness = await setupHarness({
+      gmailEnabled: true,
+      gmailUserId: "me",
+      gmailQuery: "label:inbox newer_than:7d",
+      gmailMaxResults: 10,
+      calendarEnabled: false,
+      jobsEnabled: true,
+      rulesEnabled: false,
+      googleClientId: "google-client",
+      googleClientSecretRef: "GOOGLE_CLIENT_SECRET",
+      googleRefreshTokenRef: "GOOGLE_REFRESH_TOKEN",
+    });
+
+    await expect(harness.performAction(ACTION_KEYS.GMAIL_FULL_SYNC, {
+      companyId: "company_1",
+      applyRules: false,
+    })).rejects.toThrow("Google API request failed with 500");
+
+    const syncState = harness.getState({ scopeKind: "instance", stateKey: DATA_KEYS.SYNC_STATE }) as SyncState;
+    expect(syncState.gmail.lastError).toContain("Google API request failed with 500");
+
+    const disabledHarness = await setupHarness({
+      gmailEnabled: false,
+      calendarEnabled: false,
+      rulesEnabled: false,
+    });
+    const gmailTool = await disabledHarness.executeTool(TOOL_KEYS.SYNC_GMAIL, { mode: "incremental" });
+    const rulesTool = await disabledHarness.executeTool(TOOL_KEYS.RUN_RULES, { applyRemote: true });
+
+    expect(gmailTool.error).toBe("gmail_disabled");
+    expect(rulesTool.error).toBe("rules_disabled");
+  });
+
+  it("validates config when sync features are enabled without required credentials", async () => {
+    const validation = await plugin.definition.onValidateConfig?.({
+      gmailEnabled: true,
+      calendarEnabled: true,
+      calendarIds: [],
+      jobsEnabled: true,
+      rulesEnabled: false,
+      gmailAutoReplyEnabled: true,
+    });
+
+    expect(validation).toBeDefined();
+    expect(validation?.ok).toBe(false);
+    expect(validation?.errors).toEqual(expect.arrayContaining([
+      expect.stringContaining("Google sync is enabled"),
+      expect.stringContaining("no calendar IDs"),
+    ]));
+    expect(validation?.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("inbox rules are disabled"),
+    ]));
+  });
 });
