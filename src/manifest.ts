@@ -5,7 +5,7 @@ const manifest: PaperclipPluginManifestV1 = {
   apiVersion: 1,
   version: "0.1.0",
   displayName: "Personal Admin",
-  description: "Personal admin — inbox triage, calendar prep, renewals, documents, subscriptions, errands, weekly reviews, briefings",
+  description: "AI-operable personal admin plugin for Paperclip: inbox triage, calendar prep, renewals, documents, subscriptions, errands, reviews, and daily briefings.",
   author: "turmo.dev",
   categories: ["automation"],
   capabilities: [

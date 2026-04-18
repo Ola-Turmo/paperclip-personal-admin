@@ -22,17 +22,17 @@ Single user (Ola) managing personal life admin.
 - **Subscription management** — track active subscriptions, billing dates, costs; flag cancellations
 - **Errands queue** — add, prioritize, complete errands with location and due date
 - **Weekly reviews** — structured weekly review with wins, blockers, next-week goals, habit/energy scores
-- **Daily briefings** — auto-generated morning briefing from inbox, errands, meetings, renewals
+- **Daily briefings** — auto-generated morning briefing from inbox, errands, meetings, renewals, file cleanup, and backup checks
 - **File cleanup tasks** — track old files due for cleanup, mark complete
 - **Backup checks** — register backup targets, check status, track failures
 
 ## 5. Architecture
 
-```
+```text
 Personal Admin Plugin
 ├── State: instance-scoped (per-plugin persistent storage)
-├── Actions: one per feature (add, get, triage, complete, check)
-├── Events: subscribes to agent.run.finished for ambient briefing generation
+├── Worker actions: one per feature (add, get, triage, complete, check)
+├── Events: subscribes to agent.run.finished for ambient daily briefing refresh
 └── Integrations (future): Gmail/email, calendar APIs, Norwegian governmental portals
 ```
 
@@ -53,7 +53,22 @@ Personal Admin Plugin
 | `admin.fileCleanupTasks` | FileCleanupTask[] |
 | `admin.backupChecks` | BackupCheck[] |
 
-## 7. Integrations (Future)
+## 7. MVP Action Surface
+
+| Area | Actions |
+|---|---|
+| Inbox | `add-inbox-item`, `triage-inbox-item`, `get-inbox`, `clear-inbox` |
+| Calendar prep | `add-calendar-prep`, `get-calendar-prep`, `prep-meeting` |
+| Renewals | `add-renewal`, `get-renewals`, `check-renewals` |
+| Documents | `add-document`, `get-documents`, `renew-document` |
+| Subscriptions | `add-subscription`, `get-subscriptions`, `cancel-subscription` |
+| Errands | `add-errand`, `complete-errand`, `get-errands` |
+| Weekly reviews | `start-weekly-review`, `complete-weekly-review`, `get-weekly-reviews` |
+| Daily briefings | `get-daily-briefing`, `add-briefing-item` |
+| File cleanup | `add-file-cleanup-task`, `get-file-cleanup-tasks`, `complete-file-cleanup` |
+| Backup checks | `add-backup-check`, `get-backup-checks`, `run-backup-check` |
+
+## 8. Integrations (Future)
 
 | Source | Data |
 |---|---|
@@ -63,16 +78,17 @@ Personal Admin Plugin
 | Bank APIs | subscription detection |
 | VPS/cloud providers | backup status checks |
 
-## 8. Non-Goals
+## 9. Non-Goals
 
 - Email sending or automated replies
 - Financial transaction categorization (use finance plugin)
 - Medical advice
 - Legal document generation
 
-## 9. Definition of Done
+## 10. Definition of Done
 
 - Plugin builds, typechecks, and passes tests
-- Manifest declares all actions
-- Each action reads/writes correct state namespace
+- Worker registers all MVP actions and writes to the correct state namespaces
+- Manifest declares the required capabilities and worker entrypoint
+- Daily briefing generation covers inbox, errands, meetings, renewals, cleanup tasks, and backup checks
 - PRD is current and reflects what was built

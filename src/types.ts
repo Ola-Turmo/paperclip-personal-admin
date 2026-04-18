@@ -1,19 +1,32 @@
+export type InboxSource = "email" | "sms" | "signal" | "discord" | "other";
+export type TriageStatus = "pending" | "action" | "delegate" | "defer" | "done";
+export type Priority = "low" | "medium" | "high" | "urgent";
+export type RenewalType = "insurance" | "subscription" | "license" | "membership" | "contract" | "other";
+export type DocumentType = "legal" | "financial" | "medical" | "insurance" | "property" | "identity" | "other";
+export type BillingCycle = "monthly" | "quarterly" | "yearly";
+export type ErrandCategory = "shopping" | "bureaucracy" | "repair" | "health" | "other";
+export type BriefingCategory = "inbox" | "errands" | "meetings" | "renewals" | "habits" | "general";
+export type BackupStatus = "ok" | "warning" | "fail" | "never";
+export type BackupFrequency = "daily" | "weekly" | "monthly";
+
 export interface InboxItem {
   id: string;
   content: string;
-  source: "email" | "sms" | "signal" | "discord" | "other";
+  source: InboxSource;
   receivedAt: string;
-  triageStatus: "pending" | "action" | "delegate" | "defer" | "done";
+  triageStatus: TriageStatus;
   triageNotes?: string;
-  relatedItems: string[]; // other inbox item ids
-  priority: "low" | "medium" | "high" | "urgent";
+  relatedItems: string[];
+  priority: Priority;
+  deferUntil?: string;
+  lastTriagedAt?: string;
 }
 
 export interface InboxRule {
   id: string;
   name: string;
   conditions: { field: string; operator: string; value: string }[];
-  action: "action" | "delegate" | "defer" | "done";
+  action: Exclude<TriageStatus, "pending">;
   deferUntil?: string;
 }
 
@@ -21,12 +34,14 @@ export interface CalendarPrepItem {
   id: string;
   meetingId?: string;
   attendeeName: string;
+  meetingTitle?: string;
   agenda?: string;
   myTalkingPoints: string[];
   questionsToAsk: string[];
   followUpTasks: string[];
   prepCompleted: boolean;
   prepDate: string;
+  notes?: string;
 }
 
 export interface Meeting {
@@ -36,29 +51,32 @@ export interface Meeting {
   durationMinutes: number;
   attendees: string[];
   notes?: string;
+  prepItemId?: string;
 }
 
 export interface Renewal {
   id: string;
   name: string;
-  type: "insurance" | "subscription" | "license" | "membership" | "contract" | "other";
+  type: RenewalType;
   renewalDate: string;
   cost?: number;
   currency?: string;
   autoRenew: boolean;
   reminderSent: boolean;
   notes: string;
+  lastRenewedAt?: string;
 }
 
 export interface Document {
   id: string;
   name: string;
-  type: "legal" | "financial" | "medical" | "insurance" | "property" | "identity" | "other";
+  type: DocumentType;
   expiryDate?: string;
   issuingAuthority?: string;
-  documentRef?: string; // reference number
+  documentRef?: string;
   uploadedAt: string;
   notes: string;
+  renewedAt?: string;
 }
 
 export interface Subscription {
@@ -67,12 +85,13 @@ export interface Subscription {
   provider: string;
   cost: number;
   currency: string;
-  billingCycle: "monthly" | "quarterly" | "yearly";
+  billingCycle: BillingCycle;
   nextBillingDate: string;
   active: boolean;
   category: string;
   cancelAtPeriodEnd: boolean;
   notes: string;
+  cancelledAt?: string;
 }
 
 export interface Errand {
@@ -80,16 +99,16 @@ export interface Errand {
   description: string;
   location?: string;
   dueDate?: string;
-  priority: "low" | "medium" | "high";
+  priority: Exclude<Priority, "urgent">;
   completed: boolean;
   completedAt?: string;
-  category: "shopping" | " burocracy" | "repair" | "health" | "other";
+  category: ErrandCategory;
   notes: string;
 }
 
 export interface WeeklyReview {
   id: string;
-  weekOf: string; // YYYY-Www
+  weekOf: string;
   startedAt: string;
   completedAt?: string;
   sections: {
@@ -110,9 +129,9 @@ export interface DailyBriefing {
 
 export interface BriefingItem {
   id: string;
-  category: "inbox" | "errands" | "meetings" | "renewals" | "habits" | "general";
+  category: BriefingCategory;
   content: string;
-  priority: "low" | "medium" | "high";
+  priority: Exclude<Priority, "urgent"> | "high";
   completed: boolean;
 }
 
@@ -132,8 +151,8 @@ export interface BackupCheck {
   name: string;
   target: string;
   lastCheckedAt?: string;
-  lastStatus: "ok" | "warning" | "fail" | "never";
-  frequency: "daily" | "weekly" | "monthly";
+  lastStatus: BackupStatus;
+  frequency: BackupFrequency;
   nextDue: string;
   notes: string;
 }
