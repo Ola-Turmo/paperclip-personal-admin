@@ -123,7 +123,20 @@ function QuickActions({ companyId, compact = false }: { companyId?: string | nul
   async function run(label: string, action: () => Promise<unknown>) {
     setBusy(label);
     try {
-      await action();
+      const result = await action();
+      if (
+        result &&
+        typeof result === "object" &&
+        "success" in result &&
+        result.success === false
+      ) {
+        const failedResult = result as { error?: unknown; errors?: unknown };
+        const body =
+          typeof failedResult.error === "string" ? failedResult.error :
+          Array.isArray(failedResult.errors) ? failedResult.errors.filter((entry: unknown): entry is string => typeof entry === "string").join("\n") :
+          "The action reported a failure.";
+        throw new Error(body);
+      }
       toast({ tone: "success", title: `${label} completed` });
     } catch (error) {
       toast({ tone: "error", title: "Action failed", body: error instanceof Error ? error.message : String(error) });
@@ -333,7 +346,7 @@ export function AdminPage({ context }: PluginPageProps) {
 export function AdminSidebarLink({ context }: PluginSidebarProps) {
   const prefix = context.companyPrefix ? `/${context.companyPrefix}` : "";
   return (
-    <a href={`${prefix}/plugins/personal-admin`} style={{ color: "#dce7ff", textDecoration: "none", fontWeight: 600 }}>
+    <a href={`${prefix}/personal-admin`} style={{ color: "#dce7ff", textDecoration: "none", fontWeight: 600 }}>
       Personal Admin
     </a>
   );

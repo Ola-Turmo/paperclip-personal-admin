@@ -269,4 +269,87 @@ describe("Personal Admin integrated plugin", () => {
     expect(dashboard.latestBriefing?.items.length).toBeGreaterThan(0);
     expect(dashboard.configHints.length).toBeGreaterThan(0);
   });
+
+  it("tracks the last rule matched during the current run instead of stale rule history", async () => {
+    const harness = await setupHarness({
+      gmailEnabled: false,
+      calendarEnabled: false,
+      rulesEnabled: true,
+    });
+
+    const firstRule = await harness.performAction<{ rule: { id: string } }>(ACTION_KEYS.UPSERT_RULE, {
+      name: "First manual rule",
+      appliesTo: "manual",
+      conditions: [{ field: "content", operator: "contains", value: "first" }],
+      actions: { priority: "high" },
+      stopProcessing: true,
+    });
+    const secondRule = await harness.performAction<{ rule: { id: string } }>(ACTION_KEYS.UPSERT_RULE, {
+      name: "Second manual rule",
+      appliesTo: "manual",
+      conditions: [{ field: "content", operator: "contains", value: "second" }],
+      actions: { priority: "urgent" },
+      stopProcessing: true,
+    });
+
+    await harness.performAction(ACTION_KEYS.ADD_INBOX_ITEM, {
+      content: "first follow-up",
+      source: "manual",
+    });
+    await harness.performAction(ACTION_KEYS.RUN_RULES, {
+      applyRemote: false,
+    });
+
+    await harness.performAction(ACTION_KEYS.ADD_INBOX_ITEM, {
+      content: "second follow-up",
+      source: "manual",
+    });
+    await harness.performAction(ACTION_KEYS.RUN_RULES, {
+      applyRemote: false,
+    });
+
+    const syncState = harness.getState({ scopeKind: "instance", stateKey: DATA_KEYS.SYNC_STATE }) as SyncState;
+    expect(syncState.rules.lastRuleId).toBe(secondRule.rule.id);
+    expect(syncState.rules.lastRuleId).not.toBe(firstRule.rule.id);
+  });
+
+  it("reports sync-all failures instead of claiming success when a branch fails", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const parsed = new URL(url);
+
+      if (parsed.hostname === "oauth2.googleapis.com") {
+        return jsonResponse({ access_token: "access-token" });
+      }
+
+      if (parsed.pathname.endsWith("/messages")) {
+        return jsonResponse({ error: { message: "boom" } }, 500);
+      }
+
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const harness = await setupHarness({
+      gmailEnabled: true,
+      gmailUserId: "me",
+      gmailQuery: "label:inbox newer_than:7d",
+      gmailMaxResults: 10,
+      calendarEnabled: false,
+      jobsEnabled: true,
+      rulesEnabled: true,
+      googleClientId: "google-client",
+      googleClientSecretRef: "GOOGLE_CLIENT_SECRET",
+      googleRefreshTokenRef: "GOOGLE_REFRESH_TOKEN",
+    });
+
+    const result = await harness.performAction<{ success: boolean; errors?: unknown[] }>(ACTION_KEYS.SYNC_ALL, {
+      companyId: "company_1",
+      mode: "full",
+      applyRules: true,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.errors).toEqual(expect.arrayContaining([expect.stringContaining("Google API request failed with 500")]));
+  });
 });

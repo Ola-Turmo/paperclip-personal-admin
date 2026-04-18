@@ -508,8 +508,8 @@ async function getAdminConfig(ctx: PluginContext): Promise<AdminConfig> {
   if (clientId && clientSecretRef && refreshTokenRef) {
     googleAuth = {
       clientId,
-      clientSecret: await ctx.secrets.resolve(clientSecretRef),
-      refreshToken: await ctx.secrets.resolve(refreshTokenRef),
+      clientSecretRef,
+      refreshTokenRef,
     };
   } else {
     hints.push("Add Google client ID, client secret ref, and refresh token ref in plugin settings to enable live sync.");
@@ -547,7 +547,13 @@ function ensureGoogleConfig(config: AdminConfig): asserts config is AdminConfig 
 
 async function getGoogleAccessToken(ctx: PluginContext, config: AdminConfig): Promise<string> {
   ensureGoogleConfig(config);
-  return exchangeRefreshToken(ctx, config.googleAuth);
+  const clientSecret = await ctx.secrets.resolve(config.googleAuth.clientSecretRef);
+  const refreshToken = await ctx.secrets.resolve(config.googleAuth.refreshTokenRef);
+  return exchangeRefreshToken(ctx, {
+    clientId: config.googleAuth.clientId,
+    clientSecret,
+    refreshToken,
+  });
 }
 
 function buildGmailQuery(config: AdminConfig): string | undefined {
@@ -1047,6 +1053,7 @@ async function runRulesEngine(
   const applyRemote = toBoolean(params.applyRemote, true);
   const accessToken = applyRemote && config.googleAuth ? await getGoogleAccessToken(ctx, config) : undefined;
   let matchedCount = 0;
+  let lastMatchedRuleId: string | undefined;
   const nextItems: InboxItem[] = [];
 
   for (const item of items) {
@@ -1075,6 +1082,7 @@ async function runRulesEngine(
         nextItem.autoRepliedAt = nowIso();
       }
       rule.lastAppliedAt = nowIso();
+      lastMatchedRuleId = rule.id;
       if (rule.stopProcessing) break;
     }
     nextItems.push(nextItem);
@@ -1090,7 +1098,7 @@ async function runRulesEngine(
       ...current.rules,
       lastRunAt: nowIso(),
       lastMatchCount: matchedCount,
-      lastRuleId: rules.find(rule => rule.lastAppliedAt)?.id,
+      lastRuleId: lastMatchedRuleId,
     },
   }));
 
@@ -1263,11 +1271,13 @@ async function runSyncAll(ctx: PluginContext, params: ActionParams = {}, options
     ? await runCalendarFullSync(ctx, {}, { companyId: options.companyId, reason: options.reason ?? "sync-all" }).catch(error => ({ success: false, error: error instanceof Error ? error.message : String(error) }))
     : await runCalendarIncrementalSync(ctx, {}, { companyId: options.companyId, reason: options.reason ?? "sync-all" }).catch(error => ({ success: false, error: error instanceof Error ? error.message : String(error) }));
   const briefing = await generateDailyBriefing(ctx, { refresh: true }, options.reason ?? "sync-all");
+  const failures = [gmailResult, calendarResult].filter(result => isObject(result) && result.success === false) as Array<Record<string, unknown>>;
   return {
-    success: true,
+    success: failures.length === 0,
     gmail: gmailResult,
     calendar: calendarResult,
     briefing: briefing.summary,
+    errors: failures.map(result => result.error ?? result.reason).filter(Boolean),
   };
 }
 

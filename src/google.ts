@@ -1,5 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import type { GoogleAuthConfig, GoogleCalendarEvent, GoogleGmailHistoryResponse, GoogleGmailMessage, GoogleMessageHeader } from "./types.js";
+import type { GoogleCalendarEvent, GoogleGmailHistoryResponse, GoogleGmailMessage, GoogleMessageHeader } from "./types.js";
 
 export class GoogleApiError extends Error {
   readonly status: number;
@@ -32,7 +32,7 @@ async function requestJson<T>(ctx: PluginContext, url: string, init: RequestInit
   return payload as T;
 }
 
-export async function exchangeRefreshToken(ctx: PluginContext, auth: GoogleAuthConfig): Promise<string> {
+export async function exchangeRefreshToken(ctx: PluginContext, auth: { clientId: string; clientSecret: string; refreshToken: string }): Promise<string> {
   const body = new URLSearchParams({
     client_id: auth.clientId,
     client_secret: auth.clientSecret,

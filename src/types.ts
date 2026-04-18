@@ -283,8 +283,8 @@ export interface AdminDashboardData {
 
 export interface GoogleAuthConfig {
   clientId: string;
-  clientSecret: string;
-  refreshToken: string;
+  clientSecretRef: string;
+  refreshTokenRef: string;
 }
 
 export interface AdminConfig {
