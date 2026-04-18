@@ -1,7 +1,7 @@
 {
   "name": "@ola-turmo/paperclip-personal-admin",
-  "version": "0.1.0",
-  "description": "Personal admin plugin — inbox triage, calendar prep, renewals, documents, subscriptions, errands, weekly reviews, briefings",
+  "version": "0.2.0",
+  "description": "Personal admin plugin with Gmail + Calendar sync, advanced rules, UI dashboards, and daily operational briefings",
   "author": "turmo.dev",
   "private": true,
   "type": "module",
@@ -19,6 +19,12 @@
     "@types/node": "^20.0.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.4.0",
-    "vitest": "^1.4.0"
+    "vitest": "^1.4.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   }
 }

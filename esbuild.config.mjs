@@ -1,27 +1,63 @@
 import * as esbuild from "esbuild";
 
+const watch = process.argv.includes("--watch");
+
+async function buildOne(options) {
+  if (watch) {
+    const ctx = await esbuild.context(options);
+    await ctx.watch();
+    return ctx;
+  }
+  await esbuild.build(options);
+  return null;
+}
+
 async function buildAll() {
-  await esbuild.build({
-    entryPoints: ["src/manifest.ts"],
-    bundle: false,
-    outfile: "dist/manifest.js",
+  const shared = {
     format: "esm",
+    logLevel: "info",
+    sourcemap: true,
+  };
+
+  await buildOne({
+    ...shared,
+    entryPoints: ["src/manifest.ts"],
+    bundle: true,
+    outfile: "dist/manifest.js",
     platform: "node",
     target: "node18",
   });
 
-  await esbuild.build({
+  await buildOne({
+    ...shared,
     entryPoints: ["src/worker.ts"],
     bundle: true,
     outfile: "dist/worker.js",
-    format: "esm",
     platform: "node",
     target: "node18",
-    external: ["react", "react-dom"],
-    logLevel: "info",
+    external: ["react", "react-dom", "react/jsx-runtime"],
   });
+
+  await buildOne({
+    ...shared,
+    entryPoints: ["src/ui/index.tsx"],
+    bundle: true,
+    outdir: "dist/ui",
+    platform: "browser",
+    target: "es2022",
+    jsx: "automatic",
+    external: ["react", "react-dom", "react/jsx-runtime"],
+  });
+
+  if (watch) {
+    console.log("👀 Watching plugin worker, manifest, and UI builds");
+    return;
+  }
 
   console.log("✅ Build complete");
 }
 
-buildAll().catch(e => { console.error(e); process.exit(1); });
+buildAll().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
