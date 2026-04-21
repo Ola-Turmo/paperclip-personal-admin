@@ -39,7 +39,8 @@ import type {
 type ActionParams = Record<string, unknown>;
 type CollectionKey = (typeof DATA_KEYS)[keyof typeof DATA_KEYS];
 
-const INSTANCE_SCOPE = { scopeKind: "instance" as const };
+const PERSONAL_COMPANY_NAME = "Personal";
+let personalCompanyIdPromise: Promise<string> | null = null;
 const PRIORITY_ORDER: Record<Priority, number> = { urgent: 0, high: 1, medium: 2, low: 3 };
 const ERRAND_PRIORITY_ORDER: Record<Errand["priority"], number> = { high: 0, medium: 1, low: 2 };
 const VALID_TRIAGE_STATUS = new Set<TriageStatus>(["pending", "action", "delegate", "defer", "done"]);
@@ -186,13 +187,31 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+async function resolvePersonalCompanyId(ctx: PluginContext): Promise<string> {
+  if (!personalCompanyIdPromise) {
+    personalCompanyIdPromise = (async () => {
+      const companies = await ctx.companies.list({ limit: 200, offset: 0 });
+      const personal = companies.find((company) => company.name === PERSONAL_COMPANY_NAME);
+      if (!personal?.id) {
+        throw new Error(`Personal Admin requires a '${PERSONAL_COMPANY_NAME}' company`);
+      }
+      return personal.id;
+    })();
+  }
+  return personalCompanyIdPromise;
+}
+
+async function getPersonalScope(ctx: PluginContext) {
+  return { scopeKind: "company" as const, scopeId: await resolvePersonalCompanyId(ctx) };
+}
+
 async function getCollection<T>(ctx: PluginContext, key: CollectionKey): Promise<T[]> {
-  const value = await ctx.state.get({ ...INSTANCE_SCOPE, stateKey: key });
+  const value = await ctx.state.get({ ...(await getPersonalScope(ctx)), stateKey: key });
   return Array.isArray(value) ? (value as T[]) : [];
 }
 
 async function setCollection<T>(ctx: PluginContext, key: CollectionKey, value: T[]): Promise<void> {
-  await ctx.state.set({ ...INSTANCE_SCOPE, stateKey: key }, value);
+  await ctx.state.set({ ...(await getPersonalScope(ctx)), stateKey: key }, value);
 }
 
 function sortInboxItems(items: InboxItem[]): InboxItem[] {
@@ -276,7 +295,7 @@ function defaultSyncState(): SyncState {
 }
 
 async function getSyncState(ctx: PluginContext): Promise<SyncState> {
-  const value = await ctx.state.get({ ...INSTANCE_SCOPE, stateKey: DATA_KEYS.SYNC_STATE });
+  const value = await ctx.state.get({ ...(await getPersonalScope(ctx)), stateKey: DATA_KEYS.SYNC_STATE });
   if (isObject(value)) {
     return {
       ...defaultSyncState(),
@@ -294,7 +313,7 @@ async function getSyncState(ctx: PluginContext): Promise<SyncState> {
 }
 
 async function setSyncState(ctx: PluginContext, value: SyncState): Promise<void> {
-  await ctx.state.set({ ...INSTANCE_SCOPE, stateKey: DATA_KEYS.SYNC_STATE }, value);
+  await ctx.state.set({ ...(await getPersonalScope(ctx)), stateKey: DATA_KEYS.SYNC_STATE }, value);
 }
 
 async function updateSyncState(ctx: PluginContext, updater: (current: SyncState) => SyncState): Promise<SyncState> {
